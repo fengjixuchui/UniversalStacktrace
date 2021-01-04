@@ -1,12 +1,23 @@
 #pragma once
 
 #ifdef _WIN32
-#include <windows.h>
 #include <DbgHelp.h>
+#include <windows.h>
 #else
 #include <cxxabi.h>
 #include <errno.h>
+
+#if __has_include(<libunwind.h>)
+#define USE_UNWIND (1)
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
+#elif __has_include(<execinfo.h>)
+#define USE_UNWIND (0)
 #include <execinfo.h>
+#else
+#error Please install libunwind
+#endif
+
 #include <stdio.h>
 #endif
 
@@ -15,7 +26,7 @@
 #else
 #include <libgen.h>
 #if defined(__MINGW32__) || defined(__MINGW64__)
-#define WEXITSTATUS(w)    (((w) >> 8) & 0xff)
+#define WEXITSTATUS(w) (((w) >> 8) & 0xff)
 #else
 #include <sys/wait.h>
 #endif
@@ -34,6 +45,7 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -261,8 +273,12 @@ inline StackTrace generate() {
 // Linux uses backtrace() + addr2line
 // MinGW uses CaptureStackBackTrace() + addr2line
 inline StackTrace generate() {
+  // Libunwind and some other functions aren't thread safe.
+  static std::mutex mtx;
+  std::unique_lock<std::mutex> lock(mtx);
+
   std::vector<StackTraceEntry> stackTrace;
-  std::map<std::string, uint64_t> baseAddresses;
+  std::map<std::string, std::pair<uint64_t, uint64_t> > addressMaps;
   std::string line;
   std::string procMapFileName = std::string("/proc/self/maps");
   std::ifstream infile(procMapFileName.c_str());
@@ -279,15 +295,20 @@ inline StackTrace generate() {
     if (!(iss >> addressRange >> perms >> offset >> device >> inode >> path)) {
       break;
     }  // error
-    uint64_t baseAddress = stoull(split(addressRange, '-')[0], NULL, 16);
-    if (baseAddresses.find(path) == baseAddresses.end() ||
-        baseAddresses[path] > baseAddress) {
-      baseAddresses[path] = baseAddress;
+    uint64_t startAddress = stoull(split(addressRange, '-')[0], NULL, 16);
+    uint64_t endAddress = stoull(split(addressRange, '-')[1], NULL, 16);
+    if (addressMaps.find(path) == addressMaps.end()) {
+      addressMaps[path] = std::make_pair(startAddress, endAddress);
+    } else {
+      addressMaps[path].first = std::min(addressMaps[path].first, startAddress);
+      addressMaps[path].second = std::max(addressMaps[path].second, endAddress);
     }
   }
 
+#if !USE_UNWIND
   void *stack[MAX_STACK_FRAMES];
   int numFrames;
+#endif
 #if defined(__MINGW32__) || defined(__MINGW64__)
   numFrames = CaptureStackBackTrace(1, MAX_STACK_FRAMES, stack, NULL);
 
@@ -309,80 +330,127 @@ inline StackTrace generate() {
     StackTraceEntry entry(a, addr, fileName, "", "", -1);
     stackTrace.push_back(entry);
   }
+#elif USE_UNWIND
+  unw_context_t context;
+  unw_getcontext(&context);
+
+  unw_cursor_t cursor;
+  unw_init_local(&cursor, &context);
+
+  unw_word_t ip;
+
+  for (int a = 0; unw_step(&cursor) > 0; a++) {
+    unw_get_reg(&cursor, UNW_REG_IP, &ip);
+    static const size_t kMax = 16 * 1024;
+    char mangled[kMax];
+    unw_word_t offset;
+    unw_get_proc_name(&cursor, mangled, kMax, &offset);
+
+    int ok;
+    size_t len = kMax;
+    char *demangled = abi::__cxa_demangle(mangled, 0, 0, &ok);
+
+    std::string filename;
+    uint64_t absoluteAddress = uint64_t(ip);
+    uint64_t relativeAddress = 0;
+    for (auto &it : addressMaps) {
+      if (it.second.first <= absoluteAddress &&
+          it.second.second > absoluteAddress) {
+        filename = it.first;
+        relativeAddress = absoluteAddress - it.second.first;
+      }
+    }
+
+    StackTraceEntry entry(
+        a,
+        relativeAddress ? addressToString(relativeAddress)
+                        : addressToString(absoluteAddress),
+        filename, ok == 0 ? std::string(demangled) : std::string(mangled), "",
+        -1);
+    if (demangled) {
+      free(demangled);
+    }
+    stackTrace.push_back(entry);
+  }
 #else
   numFrames = backtrace(stack, MAX_STACK_FRAMES);
   memmove(stack, stack + 1, sizeof(void *) * (numFrames - 1));
   numFrames--;
 
   char **strings = backtrace_symbols(stack, numFrames);
-  for (int a = 0; a < numFrames; ++a) {
-    std::string addr;
-    std::string fileName;
-    std::string functionName;
+  if (strings) {
+    for (int a = 0; a < numFrames; ++a) {
+      std::string addr;
+      std::string fileName;
+      std::string functionName;
 
-    const std::string line(strings[a]);
+      const std::string line(strings[a]);
 #ifdef __APPLE__
-    // Example: ust-test                            0x000000010001e883
-    // _ZNK5Catch21TestInvokerAsFunction6invokeEv + 19
-    auto p = line.find("0x");
-    if (p != std::string::npos) {
-      addr = line.substr(p);
-      auto spaceLoc = addr.find(" ");
-      functionName = addr.substr(spaceLoc + 1);
-      functionName = functionName.substr(0, functionName.find(" +"));
-      addr = addr.substr(0, spaceLoc);
-    }
-#else
-    // Example: ./ust-test(_ZNK5Catch21TestInvokerAsFunction6invokeEv+0x16)
-    // [0x55f1278af96e]
-    auto parenStart = line.find("(");
-    auto parenEnd = line.find(")");
-    fileName = line.substr(0, parenStart);
-    // Convert filename to canonical path
-    char buf[PATH_MAX];
-    ::realpath(fileName.c_str(), buf);
-    fileName = std::string(buf);
-    functionName = line.substr(parenStart + 1, parenEnd - (parenStart + 1));
-    // Strip off the offset from the name
-    functionName = functionName.substr(0, functionName.find("+"));
-    if (baseAddresses.find(fileName) != baseAddresses.end()) {
-      // Make address relative to process start
-      addr = addressToString(uint64_t(stack[a]) - baseAddresses[fileName]);
-    } else {
-      addr = addressToString(uint64_t(stack[a]));
-    }
-#endif
-    // Perform demangling if parsed properly
-    if (!functionName.empty()) {
-      int status = 0;
-      auto demangledFunctionName =
-          abi::__cxa_demangle(functionName.data(), 0, 0, &status);
-      // if demangling is successful, output the demangled function name
-      if (status == 0) {
-        // Success (see
-        // http://gcc.gnu.org/onlinedocs/libstdc++/libstdc++-html-USERS-4.3/a01696.html)
-        functionName = std::string(demangledFunctionName);
+      // Example: ust-test                            0x000000010001e883
+      // _ZNK5Catch21TestInvokerAsFunction6invokeEv + 19
+      auto p = line.find("0x");
+      if (p != std::string::npos) {
+        addr = line.substr(p);
+        auto spaceLoc = addr.find(" ");
+        functionName = addr.substr(spaceLoc + 1);
+        functionName = functionName.substr(0, functionName.find(" +"));
+        addr = addr.substr(0, spaceLoc);
       }
-      free(demangledFunctionName);
+#else
+      // Example: ./ust-test(_ZNK5Catch21TestInvokerAsFunction6invokeEv+0x16)
+      // [0x55f1278af96e]
+      auto parenStart = line.find("(");
+      auto parenEnd = line.find(")");
+      fileName = line.substr(0, parenStart);
+      // Convert filename to canonical path
+      char buf[PATH_MAX];
+      ::realpath(fileName.c_str(), buf);
+      fileName = std::string(buf);
+      functionName = line.substr(parenStart + 1, parenEnd - (parenStart + 1));
+      // Strip off the offset from the name
+      functionName = functionName.substr(0, functionName.find("+"));
+      if (addressMaps.find(fileName) != addressMaps.end()) {
+        // Make address relative to process start
+        addr =
+            addressToString(uint64_t(stack[a]) - addressMaps[fileName].first);
+      } else {
+        addr = addressToString(uint64_t(stack[a]));
+      }
+#endif
+      // Perform demangling if parsed properly
+      if (!functionName.empty()) {
+        int status = 0;
+        auto demangledFunctionName =
+            abi::__cxa_demangle(functionName.data(), 0, 0, &status);
+        // if demangling is successful, output the demangled function name
+        if (status == 0) {
+          // Success (see
+          // http://gcc.gnu.org/onlinedocs/libstdc++/libstdc++-html-USERS-4.3/a01696.html)
+          functionName = std::string(demangledFunctionName);
+        }
+        if (demangledFunctionName) {
+          free(demangledFunctionName);
+        }
+      }
+      StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
+      stackTrace.push_back(entry);
     }
-    StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
-    stackTrace.push_back(entry);
+    free(strings);
   }
-  free(strings);
 #endif
 
 // Fetch source file & line numbers
 #ifdef __APPLE__
   std::ostringstream ss;
   ss << "atos -p " << std::to_string(getpid()) << " ";
-  for (int a = 0; a < numFrames; a++) {
-    ss << "0x" << std::hex << uint64_t(stack[a]) << " ";
+  for (int a = 0; a < (int)stackTrace.size(); a++) {
+    ss << stackTrace[a].address << " ";
   }
   auto atosOutput = SystemToStr(ss.str().c_str());
   if (atosOutput.length()) {
     auto atosLines = split(atosOutput, '\n');
-    std::regex fileLineRegex("\\(([^\\(]+):([0-9]+)\\)$");
-    for (int a = 0; a < numFrames; a++) {
+    std::regex fileLineRegex("\\(([^\\(]+):([0-9]+)\\)");
+    for (int a = 0; a < (int)stackTrace.size(); a++) {
       // Find the filename and line number
       std::smatch matches;
       if (regex_search(atosLines[a], matches, fileLineRegex)) {
@@ -417,9 +485,10 @@ inline StackTrace generate() {
           std::list<std::string>(outputLines.begin(), outputLines.end());
     }
   }
-  std::regex addrToLineRegex("^(.+?) at (.+):([0-9]+)$");
+  std::regex addrToLineRegex("^(.+?) at (.+):([0-9]+)");
   for (auto &it : stackTrace) {
-    if (it.binaryFileName.length()) {
+    if (it.binaryFileName.length() &&
+        fileData.find(it.binaryFileName) != fileData.end()) {
       std::string outputLine = fileData.at(it.binaryFileName).front();
       fileData.at(it.binaryFileName).pop_front();
       if (outputLine == std::string("?? ??:0")) {
@@ -437,5 +506,5 @@ inline StackTrace generate() {
 
   return StackTrace(stackTrace);
 #endif
-}
+}  // namespace ust
 }  // namespace ust

@@ -1,6 +1,9 @@
 cmake_minimum_required (VERSION 3.0.2)
 project (UniversalStackTrace VERSION 0.0.1)
 
+SET(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/external/sanitizers-cmake/cmake" ${CMAKE_MODULE_PATH})
+FIND_PACKAGE(Sanitizers)
+
 # Enable C++-17
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -std=c++17")
 
@@ -11,9 +14,6 @@ SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -ggdb3")
 IF(APPLE)
 # Turn off address randomizing to get debug prints
 SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fno-pie")
-ELSEIF(UNIX)
-# Enable dynamic relocation
-SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -rdynamic")
 ENDIF()
 
 include_directories(
@@ -34,9 +34,17 @@ SET(
   Shlwapi
   dbghelp
 )
+ELSEIF(APPLE)
+SET(
+  CORE_LIBRARIES
+
+  System
+)
 ELSE()
 SET(
   CORE_LIBRARIES
+
+  unwind
 )
 ENDIF()
 
@@ -55,3 +63,4 @@ add_test(
   ust-test
   ust-test
 )
+add_sanitizers(ust-test)
